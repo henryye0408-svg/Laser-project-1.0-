@@ -1,0 +1,266 @@
+#TODO: upgrade the image filtering to not include things on the side, edges, rebound light... etc
+# TODO: add a feature so that when we are close enough to the center, it ignores every possible light from other places
+# TODO: add a feature so that it stops adjusting within some error of the center. like 3 pixels of error or smth. so it doesn't keep adjusting back and forth when it's close enough
+#  
+
+
+import cv2
+import numpy as np
+import time
+import sys
+import clr
+from pypylon import pylon  
+
+# =====================================================================
+# ⚙️ STEP 0: CONTROLLER CONFIGURATION & ADAPTIVE TUNING MATRIX
+# =====================================================================
+MOTOR_CHANNEL_X = 2  # Channel 2 controls Horizontal (Left/Right)
+MOTOR_CHANNEL_Y = 1  # Channel 1 controls Vertical (Down/Up)
+
+# Fine Zone Scale Multipliers
+STEPS_PER_PIXEL_X = -6
+STEPS_PER_PIXEL_Y = -6
+
+# Coarse Zone Scale Multipliers
+COARSE_THRESHOLD = 19       
+COARSE_BOOST_FACTOR = 6.0   
+
+# 🎯 THE TARGET GATE: The alignment finishes when the crosshairs 
+# intersect within this exact pixel boundary window.
+CONVERGENCE_TOLERANCE = 2  
+
+# MINIMUM PHYSICAL HARDWARE FLIGHT CEILING
+MIN_STEP_FLOOR = 40  
+
+# NON-BLOCKING MECHANICAL TIMING PARAMETERS
+MOTOR_COOLDOWN_DELAY = 0.200  # Minimum seconds to wait between motor pulses (200ms)
+last_motor_move_time = 0      # Epoch timestamp placeholder tracking last physical movement
+
+# Set up path configuration for Newport .NET Assemblies
+sys.path.append(r"C:\Program Files (x86)\New Focus\New Focus Picomotor Application\Bin")
+clr.AddReference("UsbDllWrap")
+
+from Newport.USBComm import USB
+from System.Text import StringBuilder
+
+print("Initializing Closed-Loop Automated Alignment System...")
+print("Press [SPACEBAR] to lock Iris target and engage ITERATIVE Auto-Alignment.")
+
+# ======= Internal tracking state variables =======
+is_system_locked = False
+auto_align_active = False
+alignment_successful = False  # New persistent flag for GUI success state
+
+base_iris_x = None
+base_iris_y = None
+locked_iris_radius = None
+
+try:
+    # 🔌 Initialize Newport Hardware Link (Open once and keep alive)
+    oUSB = USB(True)
+    oUSB.OpenDevices(0, True)
+    device = "8742 104479"
+
+    def move(motor, steps):
+        if steps != 0:
+            oUSB.Query(device, f"{motor}PR{steps}", StringBuilder(64))
+
+    def position(motor):
+        sb = StringBuilder(64)
+        oUSB.Query(device, f"{motor}TP?", sb)
+        return sb.ToString()
+
+    print("[SUCCESS] Newport Picomotor Controller linked successfully!")
+
+    # 📷 Initialize Basler Camera Link
+    tl_factory = pylon.TlFactory.GetInstance()
+    camera = pylon.InstantCamera(tl_factory.CreateFirstDevice())
+    camera.Open()
+    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+    print("[SUCCESS] Basler Camera System linked successfully!")
+
+    converter = pylon.ImageFormatConverter()
+    converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+
+    # =====================================================================
+    # 🔄 MAIN LIVE INTERACTIVE FEEDBACK LOOP
+    # =====================================================================
+    while camera.IsGrabbing():
+        grabResult = camera.RetrieveResult(1000, pylon.TimeoutHandling_Return)
+        
+        if grabResult.GrabSucceeded():
+            frame_array = converter.Convert(grabResult)
+            frame = frame_array.GetArray()
+            
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.medianBlur(gray, 5)
+            
+            # --------------------------------------------------------
+            # 🔵 STAGE 1: TARGET IRIS TRACKING
+            # --------------------------------------------------------
+            current_iris_x, current_iris_y, current_iris_radius = None, None, None
+            
+            if not is_system_locked:
+                circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=100,
+                                          param1=60, param2=30, minRadius=50, maxRadius=400)
+                if circles is not None:
+                    circles = np.uint16(np.around(circles))
+                    for i in circles[0, :1]:
+                        current_iris_x = int(i[0])
+                        current_iris_y = int(i[1])
+                        current_iris_radius = int(i[2])
+                
+                calibrated_iris_x = current_iris_x
+                calibrated_iris_y = current_iris_y
+                active_radius = current_iris_radius
+            else:
+                calibrated_iris_x = base_iris_x
+                calibrated_iris_y = base_iris_y
+                active_radius = locked_iris_radius
+
+            # Draw Target Pinhole overlays
+            if calibrated_iris_x is not None:
+                cv2.circle(frame, (calibrated_iris_x, calibrated_iris_y), active_radius, (255, 0, 0), 2)
+                cv2.drawMarker(frame, (calibrated_iris_x, calibrated_iris_y), (255, 0, 0), cv2.MARKER_CROSS, 15, 2)
+
+            # --------------------------------------------------------
+            # 🟢 STAGE 2: LIVE LASER RADIAL CENTROIDING
+            # --------------------------------------------------------
+            current_laser_x, current_laser_y = None, None
+            
+            phys_x = base_iris_x if is_system_locked else current_iris_x
+            phys_y = base_iris_y if is_system_locked else current_iris_y
+            phys_r = locked_iris_radius if is_system_locked else current_iris_radius
+            
+            if phys_x is not None:
+                mask = np.zeros_like(gray)
+                cv2.circle(mask, (phys_x, phys_y), phys_r + 80, 255, -1)
+                masked_gray = cv2.bitwise_and(gray, mask)
+            else:
+                masked_gray = gray.copy()
+            
+            _, maxVal, _, maxLoc = cv2.minMaxLoc(masked_gray)
+            
+            if maxVal > 80:  
+                thresh_val = 250 if maxVal >= 255 else int(maxVal * 0.8)
+                _, thresh_brightest = cv2.threshold(masked_gray, thresh_val, 255, cv2.THRESH_BINARY)
+                contours, _ = cv2.findContours(thresh_brightest, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if contours:
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    (cx, cy), _ = cv2.minEnclosingCircle(largest_contour)
+                    current_laser_x = int(cx)
+                    current_laser_y = int(cy)
+                else:
+                    current_laser_x, current_laser_y = maxLoc
+
+            # --------------------------------------------------------
+            # 📊 STAGE 3: ERROR COMPUTATION & ADAPTIVE MOTOR DRIVING
+            # --------------------------------------------------------
+            if current_laser_x is not None and calibrated_iris_x is not None:
+                error_x = current_laser_x - calibrated_iris_x
+                error_y = current_laser_y - calibrated_iris_y
+                
+                # Render the active green laser crosshair
+                cv2.drawMarker(frame, (current_laser_x, current_laser_y), (0, 255, 0), cv2.MARKER_CROSS, 12, 2)
+                
+                # Check if crosshairs have intersected within the allowable tolerance gate
+                if abs(error_x) <= CONVERGENCE_TOLERANCE and abs(error_y) <= CONVERGENCE_TOLERANCE:
+                    if auto_align_active:
+                        auto_align_active = False
+                        alignment_successful = True
+                        print(f"\n🎉 [CONVERGED] Target reached! Final Core residual error -> X: {error_x}px | Y: {error_y}px")
+                
+                # 📊 DYNAMIC HUD TEXT RENDERING
+                if alignment_successful:
+                    # 🌟 SUCCESS STATE: Display bright green verification text on screen
+                    cv2.putText(frame, "State: 🎉 ALIGNMENT COMPLETE!", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Locked Error X: {error_x}px | Y: {error_y}px", (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                else:
+                    # Draw error tracking trace line if still hunting
+                    cv2.line(frame, (calibrated_iris_x, calibrated_iris_y), (current_laser_x, current_laser_y), (0, 255, 255), 2)
+                    
+                    is_coarse = abs(error_x) > COARSE_THRESHOLD or abs(error_y) > COARSE_THRESHOLD
+                    mode_label = "⚡ COARSE BOOST" if is_coarse else "🔍 FINE TUNE"
+                    status_txt = f"Auto-Aligning [{mode_label}]" if auto_align_active else "Target Locked. Idle." if is_system_locked else "LIVE Mode"
+                    
+                    cv2.putText(frame, f"State: {status_txt}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(frame, f"Error X: {error_x}px | Y: {error_y}px", (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+                # ⚡ ITERATIVE CLOSED-LOOP CONTROL BLOCK
+                if auto_align_active:
+                    current_time = time.time()
+                    if (current_time - last_motor_move_time) >= MOTOR_COOLDOWN_DELAY:
+                        
+                        # Apply dynamic scaling based on 19px distance zone
+                        gain_x = STEPS_PER_PIXEL_X
+                        if abs(error_x) > COARSE_THRESHOLD:
+                            gain_x *= COARSE_BOOST_FACTOR  
+                            
+                        gain_y = STEPS_PER_PIXEL_Y
+                        if abs(error_y) > COARSE_THRESHOLD:
+                            gain_y *= COARSE_BOOST_FACTOR  
+
+                        # Compute baseline microsteps
+                        steps_to_take_x = int(error_x * gain_x)
+                        steps_to_take_y = int(error_y * gain_y)
+                        
+                        # Enforce Stiction Breaker Floor parameters
+                        if steps_to_take_x != 0 and abs(steps_to_take_x) < MIN_STEP_FLOOR:
+                            steps_to_take_x = int(np.sign(steps_to_take_x) * MIN_STEP_FLOOR)
+                            
+                        if steps_to_take_y != 0 and abs(steps_to_take_y) < MIN_STEP_FLOOR:
+                            steps_to_take_y = int(np.sign(steps_to_take_y) * MIN_STEP_FLOOR)
+                        
+                        print(f"🔄 Correcting Loop [{mode_label}] -> Error X: {error_x}px ({steps_to_take_x} steps) | Y: {error_y}px ({steps_to_take_y} steps)", end="\r")
+                        
+                        if steps_to_take_x != 0:
+                            move(MOTOR_CHANNEL_X, steps_to_take_x)
+                        
+                        if steps_to_take_y != 0:
+                            move(MOTOR_CHANNEL_Y, steps_to_take_y)
+                        
+                        last_motor_move_time = current_time
+
+            else:
+                cv2.putText(frame, "State: Searching Targets...", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            cv2.imshow("Automated Iterative Optics Alignment Loop", frame)
+            
+        if 'grabResult' in locals():
+            grabResult.Release()
+        
+        # --------------------------------------------------------
+        # 🎮 LIVE RUNTIME USER INTERACTION STACK
+        # --------------------------------------------------------
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == 32 and not is_system_locked:
+            if 'current_iris_x' in locals() and current_iris_x is not None and 'current_laser_x' in locals() and current_laser_x is not None:
+                base_iris_x = current_iris_x
+                base_iris_y = current_iris_y
+                locked_iris_radius = current_iris_radius
+                
+                is_system_locked = True
+                auto_align_active = True
+                alignment_successful = False
+                print("\n🔒 [TARGET LOCKED] Closing the loop. Automated execution loops running...")
+            else:
+                print("\n⚠️ Lock sequence failed! Ensure both beam profile and pinhole boundaries are visible.")
+        
+        elif key == ord('q'):
+            print("\nShutting down execution loop on user request.")
+            break
+
+except Exception as e:
+    print("\nFatal tracking thread interruption:", e)
+
+finally:
+    if 'camera' in locals() and camera.IsOpen():
+        camera.StopGrabbing()
+        camera.Close()
+    if 'oUSB' in locals():
+        oUSB.CloseDevices()
+        print("Newport USB handles severed safely.")
+    cv2.destroyAllWindows()
+    print("Clean lab system exit finished.")
