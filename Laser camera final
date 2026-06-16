@@ -1,0 +1,188 @@
+import cv2
+import numpy as np
+import time
+from pypylon import pylon
+
+print("Connecting to Basler camera. Press [SPACEBAR] to lock BOTH Iris and Laser centers!")
+
+# ======= 🌟 STATIC CALIBRATION OFFSETS (Fine-tune after locking) =======
+OFFSET_X = 0   
+OFFSET_Y = 0    
+
+# ======= Internal state variables for dual-locking =======
+is_system_locked = False
+base_iris_x = None
+base_iris_y = None
+locked_iris_radius = None
+
+locked_laser_x = None
+locked_laser_y = None
+
+try:
+    tl_factory = pylon.TlFactory.GetInstance()
+    camera = pylon.InstantCamera(tl_factory.CreateFirstDevice())
+    camera.Open()
+    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+    print("[SUCCESS] Camera system initialized successfully!")
+
+    converter = pylon.ImageFormatConverter()
+    converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+
+    while camera.IsGrabbing():
+        grabResult = camera.RetrieveResult(200, pylon.TimeoutHandling_Return)
+        
+        if grabResult.GrabSucceeded():
+            image = converter.Convert(grabResult)
+            frame = image.GetArray()
+            
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.medianBlur(gray, 5)
+            
+            # --------------------------------------------------------
+            # 🔵 STEP 1: IRIS CAPTURE (Live Tracking vs Frozen Benchmark)
+            # --------------------------------------------------------
+            current_iris_x, current_iris_y, current_iris_radius = None, None, None
+            
+            if not is_system_locked:
+                circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=100,
+                                          param1=60, param2=30, minRadius=50, maxRadius=400)
+                if circles is not None:
+                    circles = np.uint16(np.around(circles))
+                    for i in circles[0, :1]:
+                        current_iris_x, current_iris_y, current_iris_radius = i[0], i[1], i[2]
+                
+                calibrated_iris_x = current_iris_x
+                calibrated_iris_y = current_iris_y
+                active_radius = current_iris_radius
+            else:
+                calibrated_iris_x = base_iris_x + OFFSET_X
+                calibrated_iris_y = base_iris_y + OFFSET_Y
+                active_radius = locked_iris_radius
+
+            # Render Iris target crosshairs
+            if calibrated_iris_x is not None:
+                cv2.circle(frame, (calibrated_iris_x, calibrated_iris_y), active_radius, (255, 0, 0), 2)
+                cv2.drawMarker(frame, (calibrated_iris_x, calibrated_iris_y), (255, 0, 0), cv2.MARKER_CROSS, 15, 2)
+
+            # --------------------------------------------------------
+            # 🟢 STEP 2: MINIMUM ENCLOSING CIRCLE FOR ROUND LASER (Perfect Center)
+            # --------------------------------------------------------
+            current_laser_x, current_laser_y = None, None
+            
+            phys_x = base_iris_x if is_system_locked else current_iris_x
+            phys_y = base_iris_y if is_system_locked else current_iris_y
+            phys_r = locked_iris_radius if is_system_locked else current_iris_radius
+            
+            if phys_x is not None:
+                mask = np.zeros_like(gray)
+                cv2.circle(mask, (phys_x, phys_y), phys_r + 80, 255, -1)
+                masked_gray = cv2.bitwise_and(gray, mask)
+            else:
+                masked_gray = gray.copy()
+            
+            # Find the peak intensity value inside the search zone
+            _, maxVal, _, maxLoc = cv2.minMaxLoc(masked_gray)
+            
+            if maxVal > 80:  
+                # Isolate the brightest core block of the round laser
+                # If it's overexposed, it isolates the flat white disk.
+                thresh_val = 250 if maxVal >= 255 else int(maxVal * 0.8)
+                _, thresh_brightest = cv2.threshold(masked_gray, thresh_val, 255, cv2.THRESH_BINARY)
+                
+                # Find the contour of this brightest round core
+                contours, _ = cv2.findContours(thresh_brightest, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if contours:
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    # 🌟 THE BREAKTHROUGH: For a perfect circle, the center of its Minimum Enclosing Circle
+                    # is mathematically the absolute, un-biased geometric center of the laser dot.
+                    (cx, cy), _ = cv2.minEnclosingCircle(largest_contour)
+                    current_laser_x = int(cx)
+                    current_laser_y = int(cy)
+                else:
+                    current_laser_x, current_laser_y = maxLoc
+
+            # Assign active coordinates to drawing variables
+            draw_iris_x = calibrated_iris_x
+            draw_iris_y = calibrated_iris_y
+            draw_laser_x = locked_laser_x if is_system_locked else current_laser_x
+            draw_laser_y = locked_laser_y if is_system_locked else current_laser_y
+
+            # --------------------------------------------------------
+            # 📊 VISUAL OVERLAYS & ERROR COMPUTATION
+            # --------------------------------------------------------
+            if draw_laser_x is not None and draw_iris_x is not None:
+                error_x = draw_laser_x - draw_iris_x
+                error_y = draw_laser_y - draw_iris_y
+                
+                # 🌟 Visual Change: Drawing a clean green crosshair instead of a fat dot 
+                # so you can see through it and confirm it's exactly in the core center.
+                cv2.drawMarker(frame, (draw_laser_x, draw_laser_y), (0, 255, 0), cv2.MARKER_CROSS, 12, 2)
+                cv2.line(frame, (draw_iris_x, draw_iris_y), (draw_laser_x, draw_laser_y), (0, 255, 255), 2)
+                
+                cv2.putText(frame, f"Error X: {error_x}px | Y: {error_y}px", (30, 40), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                if is_system_locked:
+                    print(f"🔒 LOCKED | Calibrated Error -> X: {error_x} px | Y: {error_y} px", end="\r")
+
+            if not is_system_locked:
+                print("🔄 System is LIVE... Press [SPACEBAR] to lock and calibrate!", end="\r")
+
+            cv2.imshow("Dual-Centroid Tracking (Upgraded)", frame)
+            time.sleep(0.05)
+            
+        if 'grabResult' in locals():
+            grabResult.Release()
+        
+        # --------------------------------------------------------
+        # 🎮 USER INTERACTION & TERMINAL OFFSET PROMPTS
+        # --------------------------------------------------------
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == 32 and not is_system_locked:
+            if 'current_iris_x' in locals() and current_iris_x is not None and 'current_laser_x' in locals() and current_laser_x is not None:
+                base_iris_x = current_iris_x
+                base_iris_y = current_iris_y
+                locked_iris_radius = current_iris_radius
+                
+                locked_laser_x = current_laser_x
+                locked_laser_y = current_laser_y
+                
+                is_system_locked = True
+                print("\n🔒 [DUAL LOCK ENGAGED] Geometries perfectly frozen at circle center.")
+            else:
+                print("\n⚠️ Lock failed! Ensure both beam and iris are fully visible.")
+        
+        elif key == ord('q'):
+            break
+            
+        if is_system_locked:
+            print(f"\n⚡ Current Tuning Offset Matrix -> OFFSET_X: {OFFSET_X} | OFFSET_Y: {OFFSET_Y}")
+            print("💡 Type integer coordinate corrections, press [Enter] to cycle, or type 'q' to quit.")
+            
+            user_input_x = input(f"👉 Enter new OFFSET_X (current={OFFSET_X}): ").strip()
+            if user_input_x.lower() == 'q':
+                break
+            elif user_input_x != "":
+                try: OFFSET_X = int(user_input_x)
+                except ValueError: print("⚠️ Input mismatch: Requires an integer.")
+                
+            user_input_y = input(f"👉 Enter new OFFSET_Y (current={OFFSET_Y}): ").strip()
+            if user_input_y.lower() == 'q':
+                break
+            elif user_input_y != "":
+                try: OFFSET_Y = int(user_input_y)
+                except ValueError: print("⚠️ Input mismatch: Requires an integer.")
+                
+            print("🔄 Re-aligning overlay geometries...")
+
+except Exception as e:
+    print("\nSystem execution thread faulted:", e)
+
+finally:
+    if 'camera' in locals() and camera.IsOpen():
+        camera.StopGrabbing()
+        camera.Close()
+    cv2.destroyAllWindows()
+    print("\nHardware links detached. Run complete.")
