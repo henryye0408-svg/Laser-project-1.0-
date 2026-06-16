@@ -1,0 +1,114 @@
+import cv2  # Import OpenCV library for all image processing (drawing circles, grayscale, etc.)
+import numpy as np  # Import NumPy for handling matrices and numerical pixel arrays efficiently
+import time  # Import time module to manage loop execution speeds and prevent CPU overloading
+from pypylon import pylon  # Import Basler Pylon SDK to control your laboratory's industrial camera
+
+print("Connecting to Basler camera, launching high-precision dual-circle centroid alignment system...")
+
+# ======= 🌟 Optimization: Reduced memory buffer size to prevent historical errors from lagging current accuracy =======
+iris_history_x = []
+iris_history_y = []
+HISTORY_SIZE = 3  # Reduced to a 3-frame average to eliminate high-frequency jitter while keeping the center tightly locked to the current physical position.
+
+try:
+    tl_factory = pylon.TlFactory.GetInstance()
+    camera = pylon.InstantCamera(tl_factory.CreateFirstDevice())
+    camera.Open()
+    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+    print("[SUCCESS] High-precision anti-interference system is active!")
+
+    converter = pylon.ImageFormatConverter()
+    converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+
+    while camera.IsGrabbing():
+        grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+        
+        if grabResult.GrabSucceeded():
+            image = converter.Convert(grabResult)
+            frame = image.GetArray()
+            
+            # Basic grayscale conversion and blur processing
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.medianBlur(gray, 5)
+            
+            # --------------------------------------------------------
+            # 🌟 Optimization 1: Fine-tune Hough Circles parameters to tightly snap the blue circle to the true Iris edge
+            # --------------------------------------------------------
+            # param1=60 (Edge detection sensitivity), param2=30 (Center voting threshold; smaller values are more sensitive and better at correcting alignment shifts)
+            circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=100,
+                                      param1=60, param2=30, minRadius=50, maxRadius=400)
+            
+            iris_x, iris_y = None, None
+            if circles is not None:
+                circles = np.uint16(np.around(circles))
+                for i in circles[0, :1]:
+                    raw_iris_x, raw_iris_y, iris_radius = i[0], i[1], i[2]
+                    
+                    iris_history_x.append(raw_iris_x)
+                    iris_history_y.append(raw_iris_y)
+                    
+                    if len(iris_history_x) > HISTORY_SIZE:
+                        iris_history_x.pop(0)
+                        iris_history_y.pop(0)
+                    
+                    iris_x = int(np.mean(iris_history_x))
+                    iris_y = int(np.mean(iris_history_y))
+                    
+                    # Visual feedback: Draw the stabilized blue Iris aperture circle and center crosshair
+                    cv2.circle(frame, (iris_x, iris_y), iris_radius, (255, 0, 0), 2)
+                    cv2.drawMarker(frame, (iris_x, iris_y), (255, 0, 0), cv2.MARKER_CROSS, 15, 2)
+
+            # --------------------------------------------------------
+            # 🌟 Optimization 2: Use [Local Area Centroid Method] instead of Peak Pixel to accurately snap green dot to true Laser center
+            # --------------------------------------------------------
+            laser_x, laser_y = None, None
+            
+            if iris_x is not None:
+                mask = np.zeros_like(gray)
+                # Establish safety mask: Allow laser detection radius to expand slightly (iris_radius + 5) to block out bright metallic reflections from the Iris blades
+                cv2.circle(mask, (iris_x, iris_y), iris_radius + 5, 255, -1)
+                masked_gray = cv2.bitwise_and(gray, mask)
+                
+                # 【Core Change】: Perform local thresholding inside the masked region, isolating laser pixels brighter than 200 into a pure white blob
+                _, thresh_laser = cv2.threshold(masked_gray, 200, 255, cv2.THRESH_BINARY)
+                
+                # Compute the spatial moments of this white laser blob to find its mathematical center of mass (geometric centroid)
+                M = cv2.moments(thresh_laser)
+                if M["m00"] != 0:
+                    # These coordinates are based on the entire shape of the laser spot, preventing the algorithm from being tricked by single reflective hot spots!
+                    laser_x = int(M["m10"] / M["m00"])
+                    laser_y = int(M["m01"] / M["m00"])
+
+            # --------------------------------------------------------
+            # 3. Calculate and Display the Real-Time Dynamic Error
+            # --------------------------------------------------------
+            if laser_x is not None and iris_x is not None:
+                error_x = laser_x - iris_x
+                error_y = laser_y - iris_y
+                
+                # Draw the yellow line representing the actual error vector
+                cv2.line(frame, (iris_x, iris_y), (laser_x, laser_y), (0, 255, 255), 2)
+                # Draw the green dot representing the true laser center
+                cv2.circle(frame, (laser_x, laser_y), 10, (0, 255, 0), -1)
+                
+                print(f"[DATA] Dynamic Error -> X: {error_x} px | Y: {error_y} px")
+            else:
+                print("Waiting for high-precision dual-circle lock...")
+
+            # Display the tracking frame
+            cv2.imshow("Dual-Centroid Tracking (Upgraded)", frame)
+            time.sleep(0.05)
+            
+        grabResult.Release()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except Exception as e:
+    print("Error occurred during execution:", e)
+
+finally:
+    if 'camera' in locals() and camera.IsOpen():
+        camera.StopGrabbing()
+        camera.Close()
+    cv2.destroyAllWindows()
+    print("Program closed safely.")
