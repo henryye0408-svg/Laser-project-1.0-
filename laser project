@@ -1,0 +1,119 @@
+import cv2
+import numpy as np
+import time
+from pypylon import pylon
+
+print("Connecting to Basler camera, launching anti-interference upgraded dual-circle tracking...")
+
+# ======= 🌟 New: "Memory Buffer" to stabilize the Iris center (stores the last 5 frames) =======
+iris_history_x = []
+iris_history_y = []
+HISTORY_SIZE = 5  # Keeps track of the last 5 frames. Larger values increase stability but introduce minor latency.
+
+try:
+    tl_factory = pylon.TlFactory.GetInstance()
+    camera = pylon.InstantCamera(tl_factory.CreateFirstDevice())
+    camera.Open()
+    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+    print("[SUCCESS] Anti-interference system is active!")
+
+    converter = pylon.ImageFormatConverter()
+    converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+
+    while camera.IsGrabbing():
+        grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+        
+        if grabResult.GrabSucceeded():
+            image = converter.Convert(grabResult)
+            frame = image.GetArray()
+            
+            # Basic grayscale conversion and blur processing
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.medianBlur(gray, 5)
+            
+            # --------------------------------------------------------
+            # 🌟 Step 1 Upgrade: Locate Iris aperture and apply [Memory Smoothing Algorithm] to stop center jitter
+            # --------------------------------------------------------
+            circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=100,
+                                       param1=50, param2=50, minRadius=50, maxRadius=400)
+            
+            iris_x, iris_y = None, None
+            if circles is not None:
+                circles = np.uint16(np.around(circles))
+                for i in circles[0, :1]:
+                    raw_iris_x, raw_iris_y, iris_radius = i[0], i[1], i[2]
+                    
+                    # [Core Filter]: Append current frame's center to the memory buffer
+                    iris_history_x.append(raw_iris_x)
+                    iris_history_y.append(raw_iris_y)
+                    
+                    # If memory exceeds 5 frames, discard the oldest frame
+                    if len(iris_history_x) > HISTORY_SIZE:
+                        iris_history_x.pop(0)
+                        iris_history_y.pop(0)
+                    
+                    # [Average Calculation]: Use the mean position of the last 5 frames as the final center to eliminate jitter!
+                    iris_x = int(np.mean(iris_history_x))
+                    iris_y = int(np.mean(iris_history_y))
+                    
+                    # Draw the stabilized blue Iris aperture circle
+                    cv2.circle(frame, (iris_x, iris_y), iris_radius, (255, 0, 0), 2)
+                    cv2.drawMarker(frame, (iris_x, iris_y), (255, 0, 0), cv2.MARKER_CROSS, 15, 2)
+
+            # --------------------------------------------------------
+            # 🌟 Step 2 Upgrade: Use [Iris Mask to Block Ambient Light] and precisely capture the bottom-left laser
+            # --------------------------------------------------------
+            laser_x, laser_y = None, None
+            
+            # We can only establish the safety shield once the Iris is identified
+            if iris_x is not None:
+                # Create a black canvas (Mask) matching the size of the original grayscale image
+                mask = np.zeros_like(gray)
+                # Fill the interior of the blue circle with pure white (255) to allow laser detection
+                # For safety, slightly expand the allowed laser detection radius (e.g., iris_radius + 20)
+                cv2.circle(mask, (iris_x, iris_y), iris_radius + 20, 255, -1)
+                
+                # [Core Cropping]: Perform a bitwise AND operation between the original gray image and the mask
+                # This forces the bright background glare on the right side of the frame to pure black!
+                masked_gray = cv2.bitwise_and(gray, mask)
+                
+                # Now safely locate the brightest spot within the clean, masked image area
+                _, maxVal, _, maxLoc = cv2.minMaxLoc(masked_gray)
+                
+                # Set a threshold: Brightest spot must exceed 100 (prevents false positives when laser is off)
+                if maxVal > 100:
+                    laser_x, laser_y = maxLoc
+
+            # --------------------------------------------------------
+            # 3. Calculate and Display the Real-Time Dynamic Error
+            # --------------------------------------------------------
+            if laser_x is not None and iris_x is not None:
+                error_x = laser_x - iris_x
+                error_y = laser_y - iris_y
+                
+                # Draw yellow line representing the actual error vector
+                cv2.line(frame, (iris_x, iris_y), (laser_x, laser_y), (0, 255, 255), 2)
+                # Draw green dot representing the laser center
+                cv2.circle(frame, (laser_x, laser_y), 10, (0, 255, 0), -1)
+                
+                print(f"[DATA] Dynamic Error -> X: {error_x} px | Y: {error_y} px")
+            else:
+                print("Waiting for dual-circle precision lock...")
+
+            # Display the updated tracking frame
+            cv2.imshow("Dual-Centroid Tracking (Upgraded)", frame)
+            time.sleep(0.05)
+            
+        grabResult.Release()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except Exception as e:
+    print("Error occurred:", e)
+
+finally:
+    if 'camera' in locals() and camera.IsOpen():
+        camera.StopGrabbing()
+        camera.Close()
+    cv2.destroyAllWindows()
+    print("Program closed safely.")
