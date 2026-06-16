@@ -1,0 +1,116 @@
+import cv2
+import numpy as np
+import time
+from pypylon import pylon
+
+print("正在连接 Basler 相机，启动高精度双圆质心准直系统...")
+
+# ======= 🌟 优化：减小记忆库容量，防止历史错误数据拖累当前的准确度 =======
+iris_history_x = []
+iris_history_y = []
+HISTORY_SIZE = 3  # 降低到3帧平均，既能干掉高频抖动，又能保证圆心紧跟当前物理位置
+
+try:
+    tl_factory = pylon.TlFactory.GetInstance()
+    camera = pylon.InstantCamera(tl_factory.CreateFirstDevice())
+    camera.Open()
+    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+    print("[成功] 高精度抗干扰系统已激活！")
+
+    converter = pylon.ImageFormatConverter()
+    converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+
+    while camera.IsGrabbing():
+        grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+        
+        if grabResult.GrabSucceeded():
+            image = converter.Convert(grabResult)
+            frame = image.GetArray()
+            
+            # 基础黑白与模糊处理
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.medianBlur(gray, 5)
+            
+            # --------------------------------------------------------
+            # 🌟 优化一：微调霍夫圆参数，让蓝圈死死贴合真实的 Iris 边缘
+            # --------------------------------------------------------
+            # param1=60 (边缘检测敏感度), param2=30 (圆心投票阈值，越小越灵敏，越能修正偏差)
+            circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=100,
+                                      param1=60, param2=30, minRadius=50, maxRadius=400)
+            
+            iris_x, iris_y = None, None
+            if circles is not None:
+                circles = np.uint16(np.around(circles))
+                for i in circles[0, :1]:
+                    raw_iris_x, raw_iris_y, iris_radius = i[0], i[1], i[2]
+                    
+                    iris_history_x.append(raw_iris_x)
+                    iris_history_y.append(raw_iris_y)
+                    
+                    if len(iris_history_x) > HISTORY_SIZE:
+                        iris_history_x.pop(0)
+                        iris_history_y.pop(0)
+                    
+                    iris_x = int(np.mean(iris_history_x))
+                    iris_y = int(np.mean(iris_history_y))
+                    
+                    # 视觉反馈：画出蓝色光阑圈和中心十字
+                    cv2.circle(frame, (iris_x, iris_y), iris_radius, (255, 0, 0), 2)
+                    cv2.drawMarker(frame, (iris_x, iris_y), (255, 0, 0), cv2.MARKER_CROSS, 15, 2)
+
+            # --------------------------------------------------------
+            # 🌟 优化二：用【局部面积质心法】替代最亮点，让绿点绝对回归激光正中心
+            # --------------------------------------------------------
+            laser_x, laser_y = None, None
+            
+            if iris_x is not None:
+                mask = np.zeros_like(gray)
+                # 建立安全屏蔽罩：允许找激光的半径稍微收缩一点（iris_radius + 5），彻底挡住光阑叶片边缘的边缘反光
+                cv2.circle(mask, (iris_x, iris_y), iris_radius + 5, 255, -1)
+                masked_gray = cv2.bitwise_and(gray, mask)
+                
+                # 【核心改动】：对屏蔽罩内的区域进行局部二值化，把亮度大于 200 的激光斑块剥离出来变成纯白
+                _, thresh_laser = cv2.threshold(masked_gray, 200, 255, cv2.THRESH_BINARY)
+                
+                # 计算这块激光白斑的“空间矩（Moments）”，直接求出它的面积几何重心
+                M = cv2.moments(thresh_laser)
+                if M["m00"] != 0:
+                    # 这里的坐标是基于整个激光光斑形体算出来的绝对正中心，不再受单个最亮反光点的欺骗！
+                    laser_x = int(M["m10"] / M["m00"])
+                    laser_y = int(M["m01"] / M["m00"])
+
+            # --------------------------------------------------------
+            # 3. 计算并显示实时动态误差
+            # --------------------------------------------------------
+            if laser_x is not None and iris_x is not None:
+                error_x = laser_x - iris_x
+                error_y = laser_y - iris_y
+                
+                # 画黄色的真实误差连线
+                cv2.line(frame, (iris_x, iris_y), (laser_x, laser_y), (0, 255, 255), 2)
+                # 画绿色的激光正中心点
+                cv2.circle(frame, (laser_x, laser_y), 10, (0, 255, 0), -1)
+                
+                print(f"[精准数据] 动态误差 -> X: {error_x} 像素 | Y: {error_y} 像素")
+            else:
+                print("正在等待双圆高精度锁定...")
+
+            # 展示监控画面
+            cv2.imshow("Dual-Centroid Tracking (Upgraded)", frame)
+            time.sleep(0.05)
+            
+        grabResult.Release()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except Exception as e:
+    print("运行中发生错误:", e)
+
+
+
+finally:
+    if 'camera' in locals() and camera.IsOpen():
+        camera.StopGrabbing()
+        camera.Close()
+    cv2.destroyAllWindows()
+    print("程序已安全关闭。")
