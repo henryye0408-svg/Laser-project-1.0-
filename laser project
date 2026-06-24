@@ -1,119 +1,386 @@
+# ==========================================================
+# Robust Iris Detection with Candidate Scoring
+# ==========================================================
+
 import cv2
 import numpy as np
 import time
 from pypylon import pylon
 
-print("Connecting to Basler camera, launching anti-interference upgraded dual-circle tracking...")
+print("Starting robust iris tracker...")
 
-# ======= 🌟 New: "Memory Buffer" to stabilize the Iris center (stores the last 5 frames) =======
+HISTORY_SIZE = 5
+
+# Expected iris size in pixels
+MIN_AXIS = 150
+MAX_AXIS = 350
+
+# Tracking continuity
+MAX_JUMP = 150
+
 iris_history_x = []
 iris_history_y = []
-HISTORY_SIZE = 5  # Keeps track of the last 5 frames. Larger values increase stability but introduce minor latency.
+iris_history_major = []
+iris_history_minor = []
+
+prev_iris_x = None
+prev_iris_y = None
 
 try:
+
     tl_factory = pylon.TlFactory.GetInstance()
-    camera = pylon.InstantCamera(tl_factory.CreateFirstDevice())
+    camera = pylon.InstantCamera(
+        tl_factory.CreateFirstDevice()
+    )
+
     camera.Open()
-    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-    print("[SUCCESS] Anti-interference system is active!")
+    camera.StartGrabbing(
+        pylon.GrabStrategy_LatestImageOnly
+    )
 
     converter = pylon.ImageFormatConverter()
     converter.OutputPixelFormat = pylon.PixelType_BGR8packed
 
+    print("[SUCCESS] Camera connected")
+
     while camera.IsGrabbing():
-        grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-        
-        if grabResult.GrabSucceeded():
-            image = converter.Convert(grabResult)
-            frame = image.GetArray()
-            
-            # Basic grayscale conversion and blur processing
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.medianBlur(gray, 5)
-            
-            # --------------------------------------------------------
-            # 🌟 Step 1 Upgrade: Locate Iris aperture and apply [Memory Smoothing Algorithm] to stop center jitter
-            # --------------------------------------------------------
-            circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=100,
-                                       param1=50, param2=50, minRadius=50, maxRadius=400)
-            
-            iris_x, iris_y = None, None
-            if circles is not None:
-                circles = np.uint16(np.around(circles))
-                for i in circles[0, :1]:
-                    raw_iris_x, raw_iris_y, iris_radius = i[0], i[1], i[2]
-                    
-                    # [Core Filter]: Append current frame's center to the memory buffer
-                    iris_history_x.append(raw_iris_x)
-                    iris_history_y.append(raw_iris_y)
-                    
-                    # If memory exceeds 5 frames, discard the oldest frame
-                    if len(iris_history_x) > HISTORY_SIZE:
-                        iris_history_x.pop(0)
-                        iris_history_y.pop(0)
-                    
-                    # [Average Calculation]: Use the mean position of the last 5 frames as the final center to eliminate jitter!
-                    iris_x = int(np.mean(iris_history_x))
-                    iris_y = int(np.mean(iris_history_y))
-                    
-                    # Draw the stabilized blue Iris aperture circle
-                    cv2.circle(frame, (iris_x, iris_y), iris_radius, (255, 0, 0), 2)
-                    cv2.drawMarker(frame, (iris_x, iris_y), (255, 0, 0), cv2.MARKER_CROSS, 15, 2)
 
-            # --------------------------------------------------------
-            # 🌟 Step 2 Upgrade: Use [Iris Mask to Block Ambient Light] and precisely capture the bottom-left laser
-            # --------------------------------------------------------
-            laser_x, laser_y = None, None
-            
-            # We can only establish the safety shield once the Iris is identified
-            if iris_x is not None:
-                # Create a black canvas (Mask) matching the size of the original grayscale image
-                mask = np.zeros_like(gray)
-                # Fill the interior of the blue circle with pure white (255) to allow laser detection
-                # For safety, slightly expand the allowed laser detection radius (e.g., iris_radius + 20)
-                cv2.circle(mask, (iris_x, iris_y), iris_radius + 20, 255, -1)
-                
-                # [Core Cropping]: Perform a bitwise AND operation between the original gray image and the mask
-                # This forces the bright background glare on the right side of the frame to pure black!
-                masked_gray = cv2.bitwise_and(gray, mask)
-                
-                # Now safely locate the brightest spot within the clean, masked image area
-                _, maxVal, _, maxLoc = cv2.minMaxLoc(masked_gray)
-                
-                # Set a threshold: Brightest spot must exceed 100 (prevents false positives when laser is off)
-                if maxVal > 100:
-                    laser_x, laser_y = maxLoc
+        grabResult = camera.RetrieveResult(
+            5000,
+            pylon.TimeoutHandling_ThrowException
+        )
 
-            # --------------------------------------------------------
-            # 3. Calculate and Display the Real-Time Dynamic Error
-            # --------------------------------------------------------
-            if laser_x is not None and iris_x is not None:
-                error_x = laser_x - iris_x
-                error_y = laser_y - iris_y
-                
-                # Draw yellow line representing the actual error vector
-                cv2.line(frame, (iris_x, iris_y), (laser_x, laser_y), (0, 255, 255), 2)
-                # Draw green dot representing the laser center
-                cv2.circle(frame, (laser_x, laser_y), 10, (0, 255, 0), -1)
-                
-                print(f"[DATA] Dynamic Error -> X: {error_x} px | Y: {error_y} px")
+        if not grabResult.GrabSucceeded():
+            continue
+
+        image = converter.Convert(grabResult)
+        frame = image.GetArray()
+
+        gray = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        blurred = cv2.GaussianBlur(
+            gray,
+            (7, 7),
+            0
+        )
+
+        # ==================================================
+        # Binary image
+        # ==================================================
+
+        thresh = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            51,
+            5
+        )
+
+        kernel = np.ones((5, 5), np.uint8)
+
+        thresh = cv2.morphologyEx(
+            thresh,
+            cv2.MORPH_OPEN,
+            kernel
+        )
+
+        thresh = cv2.morphologyEx(
+            thresh,
+            cv2.MORPH_CLOSE,
+            kernel
+        )
+
+        contours, _ = cv2.findContours(
+            thresh,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        best_score = -999999
+        best_ellipse = None
+
+        # ==================================================
+        # Candidate evaluation
+        # ==================================================
+
+        for cnt in contours:
+
+            if len(cnt) < 5:
+                continue
+
+            area = cv2.contourArea(cnt)
+
+            if area < 5000:
+                continue
+
+            ellipse = cv2.fitEllipse(cnt)
+
+            (cx, cy), (major_axis, minor_axis), angle = ellipse
+
+            major = max(major_axis, minor_axis)
+            minor = min(major_axis, minor_axis)
+
+            # ------------------------------------------
+            # Size filter
+            # ------------------------------------------
+
+            if major < MIN_AXIS:
+                continue
+
+            if major > MAX_AXIS:
+                continue
+
+            # ------------------------------------------
+            # Circularity
+            # ------------------------------------------
+
+            aspect_ratio = minor / major
+
+            if aspect_ratio < 0.60:
+                continue
+
+            # ------------------------------------------
+            # Darkness inside ellipse
+            # ------------------------------------------
+
+            mask = np.zeros_like(gray)
+
+            cv2.ellipse(
+                mask,
+                ellipse,
+                255,
+                -1
+            )
+
+            mean_inside = cv2.mean(
+                gray,
+                mask=mask
+            )[0]
+
+            darkness_score = 255 - mean_inside
+
+            # ------------------------------------------
+            # Size score
+            # ------------------------------------------
+
+            target_size = 250
+
+            size_error = abs(
+                major - target_size
+            )
+
+            size_score = 100 - size_error
+
+            # ------------------------------------------
+            # Shape score
+            # ------------------------------------------
+
+            circularity_score = aspect_ratio * 100
+
+            # ------------------------------------------
+            # Tracking continuity
+            # ------------------------------------------
+
+            if prev_iris_x is not None:
+
+                distance = np.sqrt(
+                    (cx - prev_iris_x) ** 2 +
+                    (cy - prev_iris_y) ** 2
+                )
+
+                if distance > MAX_JUMP:
+                    continue
+
+                position_score = 100 - distance
+
             else:
-                print("Waiting for dual-circle precision lock...")
+                position_score = 50
 
-            # Display the updated tracking frame
-            cv2.imshow("Dual-Centroid Tracking (Upgraded)", frame)
-            time.sleep(0.05)
-            
+            # ------------------------------------------
+            # Combined score
+            # ------------------------------------------
+
+            total_score = (
+                0.40 * position_score +
+                0.25 * size_score +
+                0.25 * darkness_score +
+                0.10 * circularity_score
+            )
+
+            if total_score > best_score:
+
+                best_score = total_score
+                best_ellipse = ellipse
+
+        # ==================================================
+        # Accept best candidate
+        # ==================================================
+
+        iris_x = None
+        iris_y = None
+        laser_x = None
+        laser_y = None
+
+        if best_ellipse is not None:
+
+            (cx, cy), (major_axis, minor_axis), angle = best_ellipse
+
+            iris_history_x.append(cx)
+            iris_history_y.append(cy)
+            iris_history_major.append(major_axis)
+            iris_history_minor.append(minor_axis)
+
+            if len(iris_history_x) > HISTORY_SIZE:
+
+                iris_history_x.pop(0)
+                iris_history_y.pop(0)
+                iris_history_major.pop(0)
+                iris_history_minor.pop(0)
+
+            iris_x = int(np.mean(iris_history_x))
+            iris_y = int(np.mean(iris_history_y))
+
+            major_axis = int(
+                np.mean(iris_history_major)
+            )
+
+            minor_axis = int(
+                np.mean(iris_history_minor)
+            )
+
+            prev_iris_x = iris_x
+            prev_iris_y = iris_y
+
+            display_ellipse = (
+                (iris_x, iris_y),
+                (major_axis, minor_axis),
+                angle
+            )
+
+            cv2.ellipse(
+                frame,
+                display_ellipse,
+                (255, 0, 0),
+                2
+            )
+
+            cv2.drawMarker(
+                frame,
+                (iris_x, iris_y),
+                (255, 0, 0),
+                cv2.MARKER_CROSS,
+                20,
+                2
+            )
+
+            # ==========================================
+            # Laser search only inside iris
+            # ==========================================
+
+            mask = np.zeros_like(gray)
+
+            cv2.ellipse(
+                mask,
+                (
+                    (iris_x, iris_y),
+                    (
+                        int(major_axis * 1.1),
+                        int(minor_axis * 1.1)
+                    ),
+                    angle
+                ),
+                255,
+                -1
+            )
+
+            masked_gray = cv2.bitwise_and(
+                gray,
+                gray,
+                mask=mask
+            )
+
+            _, maxVal, _, maxLoc = cv2.minMaxLoc(
+                masked_gray
+            )
+
+            if maxVal > 100:
+                laser_x, laser_y = maxLoc
+
+        # ==================================================
+        # Error vector
+        # ==================================================
+
+        if (
+            iris_x is not None and
+            laser_x is not None
+        ):
+
+            error_x = laser_x - iris_x
+            error_y = laser_y - iris_y
+
+            cv2.line(
+                frame,
+                (iris_x, iris_y),
+                (laser_x, laser_y),
+                (0, 255, 255),
+                2
+            )
+
+            cv2.circle(
+                frame,
+                (laser_x, laser_y),
+                10,
+                (0, 255, 0),
+                -1
+            )
+
+            cv2.putText(
+                frame,
+                f"X={error_x}  Y={error_y}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2
+            )
+
+            print(
+                f"[LOCK] Error X={error_x} "
+                f"Y={error_y} "
+                f"Score={best_score:.1f}"
+            )
+
+        cv2.imshow(
+            "Threshold",
+            thresh
+        )
+
+        cv2.imshow(
+            "Robust Iris Tracker",
+            frame
+        )
+
         grabResult.Release()
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 except Exception as e:
-    print("Error occurred:", e)
+
+    print("Error:", e)
 
 finally:
-    if 'camera' in locals() and camera.IsOpen():
-        camera.StopGrabbing()
-        camera.Close()
+
+    if 'camera' in locals():
+
+        if camera.IsOpen():
+            camera.StopGrabbing()
+            camera.Close()
+
     cv2.destroyAllWindows()
+
     print("Program closed safely.")
